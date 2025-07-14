@@ -133,9 +133,10 @@ class VideoFrameHandler:
         self.baseline_pitch_samples = []
         self.baseline_pitch_frames = 0
         self.baseline_pitch_max_frames = 60  # ~2s nếu 30fps
-        # Drowsy time
-        self.drowsy_time = 0.0
-        self.last_drowsy = False
+        # Drowsy time cho từng dấu hiệu
+        self.ear_drowsy_time = 0.0
+        self.roll_drowsy_time = 0.0
+        self.pitch_drowsy_time = 0.0
         self.drowsy_time_thresh = 1.5  # giây
 
     def process(self, frame: np.array, thresholds: dict):
@@ -147,6 +148,8 @@ class VideoFrameHandler:
         head_roll_angle = 0.0
         pitch_angle = 0.0
         drowsiness_score = 0
+        now = time.perf_counter()
+        dt = now - self.state_tracker["start_time"]
         if results.multi_face_landmarks:
             landmarks = results.multi_face_landmarks[0].landmark
             EAR, coordinates = calculate_avg_ear(landmarks, self.eye_idxs["left"], self.eye_idxs["right"], frame_w, frame_h)
@@ -155,12 +158,11 @@ class VideoFrameHandler:
             frame = draw_important_landmarks(frame, landmarks, frame_w, frame_h, self.eye_idxs["left"], self.eye_idxs["right"])
             # Vẽ mesh quanh mắt như cũ
             frame = plot_eye_landmarks(frame, coordinates[0], coordinates[1], self.state_tracker["COLOR"])
-            # Tính roll bằng các điểm quanh mắt
+            # Tính roll bằng landmark tai
             head_roll_angle = get_head_roll_angle_ears(landmarks, frame_w, frame_h)
             self.head_angle = head_roll_angle
             # Tính pitch (dùng baseline)
             raw_pitch_angle = get_pitch_angle_nose_mouth(landmarks, frame_w, frame_h)
-            # Lấy baseline pitch trong 2s đầu khi mắt mở
             if self.baseline_pitch is None and EAR > thresholds["EAR_THRESH"]:
                 self.baseline_pitch_samples.append(raw_pitch_angle)
                 self.baseline_pitch_frames += 1
@@ -171,28 +173,27 @@ class VideoFrameHandler:
             else:
                 pitch_delta = 0.0
             self.pitch_angle = pitch_delta
-            # Tính drowsiness score
+            # Đếm thời gian duy trì từng dấu hiệu
+            # EAR
             if EAR < thresholds["EAR_THRESH"]:
-                drowsiness_score += 1
-            if abs(head_roll_angle) > 15:
-                drowsiness_score += 1
-            if pitch_delta < -10:
-                drowsiness_score += 1
-            self.drowsiness_score = drowsiness_score
-            # Đếm thời gian duy trì trạng thái nguy hiểm
-            now = time.perf_counter()
-            if drowsiness_score >= 2:
-                if self.last_drowsy:
-                    self.drowsy_time += now - self.state_tracker["start_time"]
-                else:
-                    self.drowsy_time = 0.0
-                self.last_drowsy = True
+                self.ear_drowsy_time += dt
             else:
-                self.drowsy_time = 0.0
-                self.last_drowsy = False
+                self.ear_drowsy_time = 0.0
+            # Roll
+            if abs(head_roll_angle) > 15:
+                self.roll_drowsy_time += dt
+            else:
+                self.roll_drowsy_time = 0.0
+            # Pitch
+            if pitch_delta < -10:
+                self.pitch_drowsy_time += dt
+            else:
+                self.pitch_drowsy_time = 0.0
             self.state_tracker["start_time"] = now
-            # Cảnh báo nếu duy trì đủ lâu
-            if self.drowsy_time >= self.drowsy_time_thresh:
+            # Cảnh báo nếu bất kỳ dấu hiệu nào vượt ngưỡng
+            if (self.ear_drowsy_time >= self.drowsy_time_thresh or
+                self.roll_drowsy_time >= self.drowsy_time_thresh or
+                self.pitch_drowsy_time >= self.drowsy_time_thresh):
                 self.state_tracker["play_alarm"] = True
                 plot_text(frame, "DROWSINESS ALERT!", ALM_txt_pos, (0, 0, 255), fntScale=1.2, thickness=3)
             else:
@@ -200,13 +201,16 @@ class VideoFrameHandler:
             EAR_txt = f"EAR: {round(EAR, 2)}"
             ROLL_txt = f"Roll: {round(head_roll_angle, 1)}"
             PITCH_txt = f"Pitch: {round(pitch_delta, 1)}"
-            SCORE_txt = f"Score: {drowsiness_score}"
+            # Hiển thị thời gian duy trì từng dấu hiệu
+            EAR_TIME_txt = f"EAR t: {self.ear_drowsy_time:.2f}s"
+            ROLL_TIME_txt = f"Roll t: {self.roll_drowsy_time:.2f}s"
+            PITCH_TIME_txt = f"Pitch t: {self.pitch_drowsy_time:.2f}s"
             plot_text(frame, EAR_txt, self.EAR_txt_pos, self.state_tracker["COLOR"])
             plot_text(frame, ROLL_txt, (10, 60), (255, 0, 255))
             plot_text(frame, PITCH_txt, (10, 90), (0, 128, 255))
-            plot_text(frame, SCORE_txt, (10, 120), (0, 0, 255) if drowsiness_score >= 2 else (0, 255, 0))
-            DROWSY_TIME_txt = f"DROWSY: {round(self.drowsy_time, 2)}s"
-            plot_text(frame, DROWSY_TIME_txt, DROWSY_TIME_txt_pos, self.state_tracker["COLOR"])
+            plot_text(frame, EAR_TIME_txt, (10, 120), (0, 0, 255) if self.ear_drowsy_time >= self.drowsy_time_thresh else (0, 255, 0))
+            plot_text(frame, ROLL_TIME_txt, (10, 150), (0, 0, 255) if self.roll_drowsy_time >= self.drowsy_time_thresh else (0, 255, 0))
+            plot_text(frame, PITCH_TIME_txt, (10, 180), (0, 0, 255) if self.pitch_drowsy_time >= self.drowsy_time_thresh else (0, 255, 0))
         else:
             self.state_tracker["last_ear"] = None
             self.state_tracker["start_time"] = time.perf_counter()
@@ -216,8 +220,9 @@ class VideoFrameHandler:
             self.head_angle = 0.0
             self.pitch_angle = 0.0
             self.drowsiness_score = 0
-            self.drowsy_time = 0.0
-            self.last_drowsy = False
+            self.ear_drowsy_time = 0.0
+            self.roll_drowsy_time = 0.0
+            self.pitch_drowsy_time = 0.0
             frame = cv2.flip(frame, 1)
         return frame, self.state_tracker["play_alarm"], self.head_angle, self.pitch_angle, self.drowsiness_score
 
